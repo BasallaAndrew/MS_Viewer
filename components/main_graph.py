@@ -2,9 +2,11 @@ from dash import html, dcc, Output, Input
 from dash.exceptions import PreventUpdate
 import plotly.express as px
 import pandas as pd
+from .functions import generate_TIC
 
 from data.df import df
 
+retention_times, intensities, ms1_dict, ms2_dict = generate_TIC(r'/Users/andrewbasalla/Code/Mass_Spec_tests_use/Mass_Spec_tools/022824_A_BSA_01.mzML')
 
 def render(app) -> html.Div:
     @app.callback(
@@ -14,24 +16,27 @@ def render(app) -> html.Div:
         ],
     )
     def display_main_graph(
-        n_clicks,
+        n_clicks, 
     ):
         if not n_clicks:
             raise PreventUpdate
 
-        figure = px.line(df, x=df.columns[0], y=df.columns[1:], template="plotly_white")
+        
+        figure = px.line(x= retention_times, y = intensities)
+        # if clickData != None:
+        #     figure.add_vline(x=clickData["points"][0]['x'],line_width=1, line_dash="dash", line_color="red")
 
-        figure.update_layout(
-            autosize=True,
-            width=1000,
-            height=700,
-            margin=dict(
-                l=0,
-                r=0,
-                b=0,
-                t=0,
-            ),
-        )
         return [figure]
-
+    
+    # @app.callback(
+    #     [Output("align-graph", "figure")],  
+    #     [
+    #         Input("align-graph", "clickData")
+    #     ],  
+    # )
+    # def update_main_graph(clickData):
+    #     figure = px.line(x= retention_times, y = intensities)
+    #     figure.add_vline(x=clickData["points"][0]['x'], line_width=1, line_dash="dash", line_color="red")
+    #     return figure
+    
     return html.Div([dcc.Graph(id="align-graph", responsive=True)], className="main")
