@@ -6,7 +6,7 @@ from .functions import generate_TIC
 
 from data.df import df
 
-retention_times, intensities, ms1_dict, ms2_dict = generate_TIC(r'/Users/andrewbasalla/Code/Mass_Spec_tests_use/Mass_Spec_tools/022824_A_BSA_01.mzML')
+retention_times, intensities, ms1_dict, ms2_dict = generate_TIC(r'data/022824_A_BSA_01.mzML')
 
 def render(app) -> html.Div:
     @app.callback(
