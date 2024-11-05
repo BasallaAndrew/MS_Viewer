@@ -9,7 +9,7 @@ def create_layout(app: Dash) -> html.Div:
     return html.Div(
         [
             header.render(app),
-            controls.render(),
+            controls.render(app),
             main_graph.render(app),
             outputs.render(app),
         ],

@@ -1,8 +1,8 @@
 from dash import html, dcc
 import dash_bootstrap_components as dbc
+from components import file_upload_modal
 
-
-def render() -> list:
+def render(app) -> list:
     return html.Div(
         [
             html.H5("Interactive plotting"),
@@ -20,6 +20,8 @@ def render() -> list:
                     ),
                 ]
             ),
+            file_upload_modal.render(app)
+            
         ],
         className="controls",
     )
