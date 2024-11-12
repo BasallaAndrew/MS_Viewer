@@ -1,6 +1,6 @@
 from dash import html, dcc
 import dash_bootstrap_components as dbc
-from components import file_upload_modal
+from components import file_upload_modal, chromatogram_dropdown
 
 def render(app) -> list:
     return html.Div(
@@ -20,7 +20,8 @@ def render(app) -> list:
                     ),
                 ]
             ),
-            file_upload_modal.render(app)
+            file_upload_modal.render(app),
+            chromatogram_dropdown.render(app)
             
         ],
         className="controls",
