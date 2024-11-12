@@ -2,11 +2,12 @@ from dash import html, dcc, Output, Input
 from dash.exceptions import PreventUpdate
 import plotly.express as px
 import pandas as pd
-from .functions import generate_TIC
 
-from data.df import df
+# from .functions import generate_TIC
 
-retention_times, intensities, ms1_dict, ms2_dict = generate_TIC(r'data/022824_A_BSA_01.mzML')
+# from data.df import df
+
+# retention_times, intensities, ms1_dict, ms2_dict = generate_TIC(r'data/022824_A_BSA_01.mzML')
 
 def render(app) -> html.Div:
     @app.callback(
@@ -22,11 +23,11 @@ def render(app) -> html.Div:
             raise PreventUpdate
 
         
-        figure = px.line(x= retention_times, y = intensities)
+        # figure = px.line(x= retention_times, y = intensities)
         # if clickData != None:
         #     figure.add_vline(x=clickData["points"][0]['x'],line_width=1, line_dash="dash", line_color="red")
 
-        return [figure]
+        return 
     
     # @app.callback(
     #     [Output("align-graph", "figure")],  
