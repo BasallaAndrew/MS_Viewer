@@ -25,11 +25,29 @@ def _array_xml(values, accession, dtype, compress):
     )
 
 
-def write_mzml(path: Path, scans: list[dict], indexed: bool = True, rt_unit: str = "minute") -> None:
+HEADER = (
+    '<referenceableParamGroupList count="1"><referenceableParamGroup id="CommonInstrumentParams">'
+    '<cvParam cvRef="MS" accession="MS:1003028" name="Orbitrap Exploris 480" value=""/>'
+    '<cvParam cvRef="MS" accession="MS:1000529" name="instrument serial number" value="SN123"/>'
+    '</referenceableParamGroup></referenceableParamGroupList>'
+    '<softwareList count="1"><software id="Xcalibur" version="4.5">'
+    '<cvParam cvRef="MS" accession="MS:1000532" name="Xcalibur" value=""/></software></softwareList>'
+    '<instrumentConfigurationList count="1"><instrumentConfiguration id="IC1"><componentList count="2">'
+    '<source order="1"><cvParam cvRef="MS" accession="MS:1000073" name="electrospray ionization" value=""/></source>'
+    '<analyzer order="2"><cvParam cvRef="MS" accession="MS:1000484" name="orbitrap" value=""/></analyzer>'
+    '</componentList></instrumentConfiguration></instrumentConfigurationList>'
+)
+
+
+def write_mzml(path: Path, scans: list[dict], indexed: bool = True, rt_unit: str = "minute",
+               chromatograms: list[dict] | None = None) -> None:
     """Write a minimal mzML. Each scan dict: level, rt, mz, intensity, and for
-    MS2: precursor, charge, iso (half-width), activation accession, ce."""
+    MS2: precursor, charge, iso (half-width), activation accession, ce.
+    Each chromatogram dict: id, time (min), values, unit_name, and optional
+    accession for the chromatogram type."""
     unit = "UO:0000031" if rt_unit == "minute" else "UO:0000010"
-    parts = ['<?xml version="1.0" encoding="utf-8"?>\n<indexedmzML><mzML><run id="t">'
+    parts = ['<?xml version="1.0" encoding="utf-8"?>\n<indexedmzML><mzML>' + HEADER +
+             '<run id="t" startTimeStamp="2026-01-02T03:04:05Z">'
              f'<spectrumList count="{len(scans)}">\n']
     offsets = []
     for i, s in enumerate(scans):
@@ -71,12 +89,32 @@ def write_mzml(path: Path, scans: list[dict], indexed: bool = True, rt_unit: str
             f'<spectrum index="{i}" id="controllerType=0 controllerNumber=1 scan={scan_no}" '
             f'defaultArrayLength="{len(s["mz"])}">' + "".join(body) + "</spectrum>\n"
         )
-    parts.append("</spectrumList></run></mzML>\n")
+    parts.append("</spectrumList>")
+    chrom_offsets = []
+    chromatograms = chromatograms or []
+    if chromatograms:
+        parts.append(f'<chromatogramList count="{len(chromatograms)}">')
+        for i, c in enumerate(chromatograms):
+            chrom_offsets.append(len("".join(parts).encode()))
+            time_xml = _array_xml(c["time"], "MS:1000595", "<f8", compress=True).replace(
+                'name="array" value=""', 'name="time array" value="" unitAccession="UO:0000031" unitName="minute"')
+            value_xml = _array_xml(c["values"], "MS:1000515", "<f4", compress=False).replace(
+                'name="array" value=""', f'name="intensity array" value="" unitName="{c.get("unit_name", "")}"')
+            parts.append(
+                f'<chromatogram index="{i}" id="{c["id"]}" defaultArrayLength="{len(c["time"])}">'
+                f'<cvParam cvRef="MS" accession="{c.get("accession", "MS:1003019")}" name="type" value=""/>'
+                f'<binaryDataArrayList count="2">{time_xml}{value_xml}</binaryDataArrayList></chromatogram>'
+            )
+        parts.append("</chromatogramList>")
+    parts.append("</run></mzML>\n")
     if indexed:
         index_offset = len("".join(parts).encode())
-        parts.append('<indexList count="1"><index name="spectrum">')
+        parts.append('<indexList count="2"><index name="spectrum">')
         for i, (s, off) in enumerate(zip(scans, offsets)):
             parts.append(f'<offset idRef="scan={s.get("scan", i + 1)}">{off}</offset>')
+        parts.append('</index><index name="chromatogram">')
+        for c, off in zip(chromatograms, chrom_offsets):
+            parts.append(f'<offset idRef="{c["id"]}">{off}</offset>')
         parts.append(f"</index></indexList><indexListOffset>{index_offset}</indexListOffset>")
     parts.append("</indexedmzML>\n")
     path.write_bytes("".join(parts).encode())

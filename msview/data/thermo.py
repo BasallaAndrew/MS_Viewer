@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -33,6 +34,9 @@ ACTIVATION_NAMES = {
     "NegativeElectronTransferDissociation": "NETD",
     "PQD": "PQD",
 }
+
+# Status-log fields that are codes/states rather than measurements.
+_STATUS_NOISE = re.compile(r"not ready|buffer size|\b(state|mode|code)\b", re.I)
 
 _clr_lock = threading.Lock()
 _clr_ready = False
@@ -195,3 +199,132 @@ class ThermoSource(RawSource):
             return Spectrum(
                 _to_numpy(seg.Positions), _to_numpy(seg.Intensities), bool(stats.IsCentroidScan)
             )
+
+    # --- method / run information ------------------------------------------
+
+    def method_info(self):
+        from ThermoFisher.CommonCore.Data.Business import Device
+
+        info = super().method_info()
+        with self._lock:
+            try:
+                for name, part in (
+                    ("sample", self._add_sample_info),
+                    ("instrument", self._add_instrument_info),
+                    ("tune data", self._add_tune_data),
+                    ("instrument method", self._add_methods),
+                    ("status logs", self._add_status_logs),
+                ):
+                    try:
+                        part(info)
+                    except Exception as e:  # one vendor quirk shouldn't hide the rest
+                        info.rows.append(("Problems reading the file", "", name, str(e)))
+            finally:
+                self._raw.SelectInstrument(Device.MS, 1)
+        return info
+
+    def _add_sample_info(self, info) -> None:
+        si, header = self._raw.SampleInformation, self._raw.FileHeader
+        info.add("Sample", "Sample", [
+            ("Sample name", si.SampleName), ("Sample ID", si.SampleId), ("Sample type", si.SampleType),
+            ("Vial", si.Vial), ("Injection volume (µL)", f"{si.InjectionVolume:g}"),
+            ("Dilution factor", f"{si.DilutionFactor:g}"), ("Comment", si.Comment),
+            ("Sequence row", si.RowNumber),
+        ])
+        info.add("Sample", "User text", [(f"User text {i + 1}", t) for i, t in enumerate(si.UserText or [])])
+        info.add("Sample", "File", [
+            ("Acquired", header.CreationDate), ("Operator", header.WhoCreatedId),
+            ("Description", header.FileDescription), ("Original path", si.RawFileName),
+            ("Instrument method file", si.InstrumentMethodFile),
+            ("Processing method file", si.ProcessingMethodFile),
+        ])
+
+    def _add_instrument_info(self, info) -> None:
+        data, run = self._raw.GetInstrumentData(), self._raw.RunHeaderEx
+        info.add("Instrument", "Mass spectrometer", [
+            ("Model", data.Model or data.Name), ("Serial number", data.SerialNumber),
+            ("Software version", data.SoftwareVersion), ("Hardware version", data.HardwareVersion),
+            ("Mass range (all scans)", f"{run.LowMass:g} – {run.HighMass:g} m/z"),
+            ("Acquisition time", f"{run.StartTime:.2f} – {run.EndTime:.2f} min"),
+        ])
+        try:
+            names = list(self._raw.GetAllInstrumentNamesFromInstrumentMethod())
+        except Exception:
+            names = []
+        info.add("Instrument", "Devices in method", [(f"Device {i + 1}", n) for i, n in enumerate(names)])
+
+    def _add_tune_data(self, info) -> None:
+        raw = self._raw
+        count = raw.GetTuneDataCount()
+        labels = [str(h.Label) for h in raw.GetTuneDataHeaderInformation()] if count else []
+        for t in range(count):
+            section = "Tune" if count == 1 else f"Tune {t + 1}"
+            group = ""
+            for label, value in zip(labels, raw.GetTuneDataValues(t, True).Values):
+                label = label.strip().rstrip(":").strip()
+                if label.startswith("==="):
+                    group = label.strip("= ").rstrip(":")
+                    continue
+                info.add(section, group, [(label, value)])
+
+    def _add_methods(self, info) -> None:
+        from msview.method import parse_gradient, parse_method_text
+
+        raw = self._raw
+        try:
+            names = list(raw.GetAllInstrumentNamesFromInstrumentMethod())
+        except Exception:
+            names = []
+        for i in range(raw.InstrumentMethodsCount):
+            text = str(raw.GetInstrumentMethod(i) or "")
+            if not text.strip():
+                continue
+            name = str(names[i]) if i < len(names) else text.strip().splitlines()[0].strip()
+            info.method_text.append((name, text))
+            for group, key, value in parse_method_text(text):
+                info.rows.append((f"Method: {name}", group, key, value))
+            if info.gradient is None:
+                info.gradient = parse_gradient(text)
+
+    def _add_status_logs(self, info) -> None:
+        """Numeric, non-constant status-log fields of every device as traces
+        (LC devices first: pump %B, pressure and flow, oven temperature...)."""
+        from ThermoFisher.CommonCore.Data.Business import Device
+
+        raw = self._raw
+        devices = [(Device.Other, i) for i in range(1, raw.GetInstrumentCountOfType(Device.Other) + 1)]
+        devices += [(Device.MS, 1)]
+        for device_type, number in devices:
+            raw.SelectInstrument(device_type, number)
+            name = str(raw.GetInstrumentData().Name or device_type)
+            info.traces += self._status_log_traces(name)
+
+    def _status_log_traces(self, device_name: str) -> list:
+        from msview.method import Trace
+
+        raw = self._raw
+        n = raw.GetStatusLogEntriesCount()
+        if n < 2:
+            return []
+        labels = [str(h.Label).strip().rstrip(":").strip() for h in raw.GetStatusLogHeaderInformation()]
+        rt = np.empty(n)
+        table = []
+        for i in range(n):
+            entry = raw.GetStatusLogValues(i, False)
+            rt[i] = entry.RetentionTime
+            table.append(list(entry.Values))
+        order = np.argsort(rt, kind="stable")
+        traces = []
+        for j, label in enumerate(labels):
+            values = np.full(n, np.nan)
+            for i, row in enumerate(table):
+                try:
+                    values[i] = float(row[j])
+                except (IndexError, ValueError, TypeError):
+                    pass
+            finite = np.isfinite(values)
+            if (finite.mean() < 0.9 or np.nanmax(values) == np.nanmin(values)
+                    or _STATUS_NOISE.search(label)):
+                continue  # text fields, constants and status codes make dull plots
+            traces.append(Trace(label, device_name, rt[order], values[order]))
+        return traces

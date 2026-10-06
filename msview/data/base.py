@@ -89,6 +89,19 @@ class RawSource(ABC):
             out[i] = spec.intensity[lo:hi].sum()
         return ms1["rt"], out, ms1["scan"]
 
+    def method_info(self):
+        """Run and method information (msview.method.MethodInfo).
+
+        The base version summarises the scan index; backends add whatever
+        their format stores (sample, instrument, method text, pump logs).
+        """
+        from msview.method import MethodInfo, summary_rows
+
+        info = MethodInfo()
+        for group, key, value in summary_rows(self.scan_index()):
+            info.rows.append(("Acquisition summary", group, key, value))
+        return info
+
     def spectrum(self, scan: int) -> Spectrum:
         with self._cache_lock:
             hit = self._cache.get(scan)

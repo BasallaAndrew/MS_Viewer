@@ -56,6 +56,9 @@ DTYPES = {b"MS:1000523": "<f8", b"MS:1000521": "<f4", b"MS:1000522": "<i8", b"MS
 ZLIB = b"MS:1000574"
 NUMPRESS = (b"MS:1002312", b"MS:1002313", b"MS:1002314")
 MZ_ARRAY = b"MS:1000514"
+TIME_ARRAY = b"MS:1000595"
+TIC_CHROMATOGRAM = b"MS:1000235"
+BPC_CHROMATOGRAM = b"MS:1000628"
 INTENSITY_ARRAY = b"MS:1000515"
 
 
@@ -98,18 +101,25 @@ class MzMLSource(RawSource):
             offsets = self._offsets_by_scanning()
         return offsets
 
-    def _offsets_from_index(self) -> np.ndarray | None:
+    def _index_entries(self, name: bytes) -> list[tuple[bytes, int]] | None:
+        """(id, offset) pairs from the indexedmzML index named `name`."""
         tail = os.pread(self._fd, 4096, max(0, self._size - 4096))
         m = re.search(rb"<indexListOffset>(\d+)</indexListOffset>", tail)
         if not m:
             return None
         start = int(m.group(1))
         block = os.pread(self._fd, self._size - start, start)
-        s = block.find(b'<index name="spectrum"')
+        s = block.find(b'<index name="' + name + b'"')
         if s < 0:
             return None
         e = block.find(b"</index>", s)
-        offsets = np.array([int(o) for _, o in _OFFSET.findall(block[s:e])], dtype=np.int64)
+        return [(i, int(o)) for i, o in _OFFSET.findall(block[s:e])]
+
+    def _offsets_from_index(self) -> np.ndarray | None:
+        entries = self._index_entries(b"spectrum")
+        if entries is None:
+            return None
+        offsets = np.array([o for _, o in entries], dtype=np.int64)
         # Guard against a stale or broken index.
         if not len(offsets) or not os.pread(self._fd, 9, int(offsets[0])).startswith(b"<spectrum"):
             return None
@@ -210,10 +220,10 @@ class MzMLSource(RawSource):
             self.scan_index()
         return self._decode(int(self._offsets[self._scan_to_pos[scan]]))
 
-    def _decode(self, offset: int) -> Spectrum:
-        element = self._read_until(offset, b"</spectrum>", chunk=65536)
-        centroid = CENTROID in _cv_params(element[: element.find(b"<binaryDataArrayList")])
-        mz = intensity = None
+    @staticmethod
+    def _decode_arrays(element: bytes) -> list[tuple[dict, np.ndarray, bytes]]:
+        """Every binaryDataArray in an element as (cvParams, float64 values, header)."""
+        arrays = []
         for block in _ARRAY.findall(element):
             header, _, _ = block.partition(b"<binary>")
             cv = _cv_params(header)
@@ -224,7 +234,14 @@ class MzMLSource(RawSource):
             raw = base64.b64decode(m.group(1)) if m else b""
             if ZLIB in cv and raw:
                 raw = zlib.decompress(raw)
-            values = np.frombuffer(raw, dtype=dtype).astype(np.float64)
+            arrays.append((cv, np.frombuffer(raw, dtype=dtype).astype(np.float64), header))
+        return arrays
+
+    def _decode(self, offset: int) -> Spectrum:
+        element = self._read_until(offset, b"</spectrum>", chunk=65536)
+        centroid = CENTROID in _cv_params(element[: element.find(b"<binaryDataArrayList")])
+        mz = intensity = None
+        for cv, values, _ in self._decode_arrays(element):
             if MZ_ARRAY in cv:
                 mz = values
             elif INTENSITY_ARRAY in cv:
@@ -235,3 +252,82 @@ class MzMLSource(RawSource):
             order = np.argsort(mz, kind="stable")
             mz, intensity = mz[order], intensity[order]
         return Spectrum(mz, intensity, centroid)
+
+    # --- method / run information ------------------------------------------
+
+    def method_info(self):
+        """mzML keeps no instrument method, but it does record the instrument,
+        software and source file, and converters often carry over pump
+        pressure traces as chromatograms."""
+        info = super().method_info()
+        head = os.pread(self._fd, min(self._size, 1_200_000), 0)
+        run_start = head.find(b"<run ")
+        run = re.search(rb'startTimeStamp="([^"]*)"', head[run_start:run_start + 2000]) if run_start >= 0 else None
+        if run_start >= 0:
+            head = head[:run_start]
+
+        def names(block: bytes) -> list[str]:
+            return [dict(_ATTR.findall(t)).get(b"name", b"").decode() for t in _CV.findall(block)]
+
+        instrument = []
+        for group in re.findall(rb"<referenceableParamGroup\b.*?</referenceableParamGroup>", head, re.S):
+            for tag in _CV.findall(group):
+                attrs = dict(_ATTR.findall(tag))
+                name, value = attrs.get(b"name", b"").decode(), attrs.get(b"value", b"").decode()
+                instrument.append(("Model", name) if not value else (name.capitalize(), value))
+        for kind in (b"source", b"analyzer", b"detector"):
+            found = []
+            for block in re.findall(rb"<" + kind + rb"\b[^>]*>(.*?)</" + kind + rb">", head, re.S):
+                found += [n for n in names(block) if n and n not in found]
+            if found:
+                instrument.append((kind.decode().capitalize(), ", ".join(found)))
+        info.add("Instrument", "Mass spectrometer", instrument)
+
+        software = []
+        for attrs, body in re.findall(rb"<software\b([^>]*)>(.*?)</software>", head, re.S):
+            a = dict(_ATTR.findall(attrs))
+            label = next((n for n in names(body) if n), a.get(b"id", b"").decode())
+            software.append((label, a.get(b"version", b"").decode() or "(unknown version)"))
+        info.add("Instrument", "Software", software)
+
+        source = []
+        for tag in re.findall(rb"<sourceFile\b[^>]*>", head):
+            a = dict(_ATTR.findall(tag))
+            source.append(("Source file", (a.get(b"name", b"")).decode()))
+        for tag in _CV.findall(b"".join(re.findall(rb"<sample\b.*?</sample>", head, re.S))):
+            a = dict(_ATTR.findall(tag))
+            source.append((a.get(b"name", b"").decode().capitalize(), a.get(b"value", b"").decode()))
+        if run:
+            source.append(("Acquired", run.group(1).decode()))
+        info.add("Sample", "File", source)
+        info.add("Sample", "File", [("mzML file", os.path.basename(self.path))])
+
+        info.traces = self._chromatogram_traces()
+        return info
+
+    def _chromatogram_traces(self) -> list:
+        """Non-MS chromatograms (e.g. pump pressure) as traces."""
+        from msview.method import Trace
+
+        traces = []
+        for chrom_id, offset in self._index_entries(b"chromatogram") or []:
+            element = self._read_until(offset, b"</chromatogram>", chunk=65536)
+            cv = _cv_params(element[: element.find(b"<binaryDataArrayList")])
+            if TIC_CHROMATOGRAM in cv or BPC_CHROMATOGRAM in cv:
+                continue
+            time = values = None
+            unit = ""
+            for array_cv, data, header in self._decode_arrays(element):
+                if TIME_ARRAY in array_cv:
+                    time = data / 60.0 if array_cv[TIME_ARRAY][1] in SECONDS else data
+                else:
+                    values = data
+                    m = re.search(rb'unitName="([^"]*)"', header)
+                    unit = m.group(1).decode() if m else ""
+            if time is None or values is None or len(time) != len(values) or len(time) < 2:
+                continue
+            if unit == "pascal":
+                values, unit = values / 1e5, "bar"
+            name = chrom_id.decode()
+            traces.append(Trace(f"{name} ({unit})" if unit else name, "", time, values))
+        return traces

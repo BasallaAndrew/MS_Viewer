@@ -78,6 +78,16 @@ Toolbar: switch the chromatogram between TIC, base peak and XIC. The status bar 
 
 XIC: choose **XIC** in the dropdown, type an m/z and press Return (or click Extract). Set the tolerance in ppm (default 10) or Da (default 0.01). The m/z box starts out filled with the current MS2's precursor. The XIC sums the MS1 intensity inside the window for every scan. It takes about 1 s for a Thermo file and a few seconds for a large mzML. Results are cached, so switching back to an XIC you've already extracted is instant.
 
+### Method view
+
+Set **View** in the toolbar to **Method & run info** to replace the MS1/MS2 panes with:
+
+- **Gradient plot.** The programmed %B is read from the LC pump method and drawn dashed. The %B the pump actually logged is drawn solid. **Right axis** plots any other logged trace: pressure by default, or flow, column temperature, spray current, capillary temperature and so on. The chromatogram selection is mirrored here, and hovering shows every value at that time.
+- **Parameters tab.** A searchable table with an acquisition summary computed from the scans (cycle time, MS2 per cycle, activation and energy, isolation width, charges), plus sample, instrument, tune and each LC/MS device's method settings. Type in the filter box to narrow it down (for example "resolution" or "AGC"). ⌘C copies the selected rows; right-click to copy everything.
+- **Method text tab.** The full instrument method exactly as stored in the file.
+
+How much there is depends on the file. Thermo `.raw` files carry the method, tune data and device status logs. The gradient table parser understands Agilent pump methods and Dionex/Vanquish-style `%B` scripts. mzML files keep only the instrument, software and source file, plus any pump-pressure traces the converter kept.
+
 Notes:
 - Averaging uses at most 500 scans. A wider range is sampled evenly across the range, with a warning in the status bar. Centroid scans are merged into 5 ppm bins. Profile scans are interpolated onto a shared m/z grid.
 - For Thermo files, spectra come from the centroid stream when one exists, as the spec requires. Otherwise the profile data is used.
@@ -89,6 +99,8 @@ msview/
   __main__.py      CLI entry point
   app.py           main window, selection state, background work
   panes.py         chromatogram / MS1 / MS2 panes and mouse handling
+  method_pane.py   Method view: gradient plot, parameter table, method text
+  method.py        method/run info model and method-text / gradient parsers
   index.py         scan-index dtype and selection logic (pure functions)
   averaging.py     centroid and profile averaging
   data/

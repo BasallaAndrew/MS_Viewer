@@ -12,6 +12,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from msview import index as ix
 from msview.data import SUPPORTED_SUFFIXES, BackendUnavailable, RawSource, open_source
+from msview.method_pane import MethodPane
 from msview.panes import MS1_PEN, ChromatogramPane, MS2Pane, SpectrumPane
 
 MAX_AVERAGE_SCANS = 500
@@ -38,6 +39,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ms2_where = ""
         self._generation = 0  # invalidates stale background results
         self._xic_generation = 0
+        self._method_state = "empty"  # empty / loading / loaded, for the current file
         self._xic_cache: dict[tuple, tuple] = {}  # (mz, tol_da) -> (rt, intensity, scans)
         # Python threads rather than QThreadPool: pythonnet (Thermo backend)
         # only works on threads Python created.
@@ -61,16 +63,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ms2.set_spectrum(None, "MS2")
         self.ms2.set_nav_enabled(False, False)
 
+        self.method = MethodPane()
+
+        # Below the chromatogram: either the MS1/MS2 spectra or the Method view.
+        spectra = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        spectra.setChildrenCollapsible(False)
+        spectra.addWidget(self.ms1)
+        spectra.addWidget(self.ms2)
+        spectra.setSizes([350, 350])
+        self.lower = QtWidgets.QStackedWidget()
+        self.lower.addWidget(spectra)
+        self.lower.addWidget(self.method)
+
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         splitter.setChildrenCollapsible(False)
-        for pane in (self.chrom, self.ms1, self.ms2):
-            splitter.addWidget(pane)
+        splitter.addWidget(self.chrom)
+        splitter.addWidget(self.lower)
+        splitter.setSizes([300, 700])
+        self.setCentralWidget(splitter)
+        for pane in (self.chrom, self.ms1, self.ms2, self.method.gradient):
             pane.hover.connect(self.statusBar().showMessage)
             pane.activated.connect(lambda p=pane: self.set_active_pane(p))
         self.active_pane = self.chrom
         self.chrom.set_active(True)
-        splitter.setSizes([300, 350, 350])
-        self.setCentralWidget(splitter)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
 
         self.chrom.clicked.connect(self._on_chrom_clicked)
         self.chrom.rangeSelected.connect(self.select_range)
@@ -109,19 +125,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.xic_action = toolbar.addWidget(self._build_xic_fields())
         self.xic_action.setVisible(False)
         toolbar.addSeparator()
+        toolbar.addWidget(QtWidgets.QLabel(" View: "))
+        self.view_box = QtWidgets.QComboBox()
+        self.view_box.addItems(["MS1 / MS2 spectra", "Method & run info"])
+        self.view_box.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.view_box.setToolTip("What to show below the chromatogram")
+        self.view_box.currentIndexChanged.connect(self._on_view_changed)
+        toolbar.addWidget(self.view_box)
+        toolbar.addSeparator()
         self.file_label = QtWidgets.QLabel("No file")
         self.file_label.setContentsMargins(8, 0, 8, 0)
         toolbar.addWidget(self.file_label)
 
-        for key, handler in (
-            (QtCore.Qt.Key.Key_Left, lambda: self.step_horizontal(-1)),
-            (QtCore.Qt.Key.Key_Right, lambda: self.step_horizontal(1)),
-            (QtCore.Qt.Key.Key_Up, lambda: self.step_ms2(-1)),
-            (QtCore.Qt.Key.Key_Down, lambda: self.step_ms2(1)),
-        ):
-            shortcut = QtGui.QShortcut(QtGui.QKeySequence(key), self)
-            shortcut.setAutoRepeat(True)
-            shortcut.activated.connect(handler)
 
     def _build_xic_fields(self) -> QtWidgets.QWidget:
         box = QtWidgets.QWidget()
@@ -158,8 +173,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- keyboard target ---------------------------------------------------
 
+    def keyPressEvent(self, event):
+        # Arrow keys reach here only when no text box / table has focus, so
+        # typing an m/z or browsing the parameter table keeps its own arrows.
+        handlers = {
+            QtCore.Qt.Key.Key_Left: lambda: self.step_horizontal(-1),
+            QtCore.Qt.Key.Key_Right: lambda: self.step_horizontal(1),
+            QtCore.Qt.Key.Key_Up: lambda: self.step_ms2(-1),
+            QtCore.Qt.Key.Key_Down: lambda: self.step_ms2(1),
+        }
+        handler = handlers.get(event.key())
+        if handler is None:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+        handler()
+
     def set_active_pane(self, pane):
         """The last pane clicked decides what ← / → do (highlighted header)."""
+        self.setFocus()  # take the arrow keys back from any text box
         if pane is self.active_pane:
             return
         self.active_pane.set_active(False)
@@ -172,6 +204,44 @@ class MainWindow(QtWidgets.QMainWindow):
             self.step_ms2(step)
         else:
             self.step_ms1(step)
+
+    # --- method view ---------------------------------------------------------
+
+    def _method_view(self) -> bool:
+        return self.view_box.currentIndex() == 1
+
+    def _on_view_changed(self, index: int):
+        self.lower.setCurrentIndex(index)
+        if not self._method_view() and self.active_pane is self.method.gradient:
+            self.set_active_pane(self.chrom)
+        self._load_method_info()
+
+    def _load_method_info(self):
+        """Read method/run info in the background the first time it's needed."""
+        if not self._method_view() or self.source is None or self._method_state != "empty":
+            return
+        self._method_state = "loading"
+        self.method.set_info(None, "Reading method information…")
+        source = self.source
+
+        def done(info):
+            if source is self.source:
+                self._method_state = "loaded"
+                self.method.set_info(info)
+                self._sync_method_cursor()
+
+        def failed(exc):
+            if source is self.source:
+                self._method_state = "loaded"
+                self.method.set_info(None, f"Could not read method information: {exc}")
+
+        self._run(source.method_info, done, failed)
+
+    def _sync_method_cursor(self):
+        if self.current_ms1 is not None:
+            self.method.gradient.show_cursor(float(self.idx["rt"][ix.row_of(self.idx, self.current_ms1)]))
+        elif self.rt_range is not None:
+            self.method.gradient.show_range(*self.rt_range)
 
     # --- background work --------------------------------------------------
 
@@ -228,6 +298,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.source.close()
         self.source, self.idx = None, None
         self._xic_cache.clear()
+        self._method_state = "empty"
+        self.method.set_info(None, f"Loading {path.name}…")
         self.current_ms1, self.rt_range = None, None
         self.ms2_list = np.empty(0, dtype=np.int32)
         self.chrom.clear()
@@ -297,6 +369,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.statusBar().showMessage(f"Loaded {path.name}", 3000)
         self._update_chromatogram(keep_view=False)
+        self._load_method_info()
         if n_ms1:
             # Start at the most intense point of the run.
             rt, tic, scans = source.chromatogram("tic")
@@ -420,6 +493,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row = self.idx[ix.row_of(self.idx, scan)]
         self.current_ms1, self.rt_range = scan, None
         self.chrom.show_cursor(float(row["rt"]))
+        self.method.gradient.show_cursor(float(row["rt"]))
         spec = self.source.spectrum(scan)
         self.ms1.set_spectrum(spec, f"MS1   |   scan {scan}   |   RT {row['rt']:.3f} min",
                               export_name=f"ms1_scan{scan}.csv")
@@ -437,6 +511,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.current_ms1, self.rt_range = None, (rt0, rt1)
         self.chrom.show_range(rt0, rt1)
+        self.method.gradient.show_range(rt0, rt1)
         self._set_ms2_list(ix.ms2_in_range(self.idx, rt0, rt1), "in this range")
 
         used = ix.evenly_subsample(ms1_scans, MAX_AVERAGE_SCANS)
