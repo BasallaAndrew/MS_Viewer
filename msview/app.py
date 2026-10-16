@@ -13,10 +13,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from msview import index as ix
 from msview.data import SUPPORTED_SUFFIXES, BackendUnavailable, RawSource, open_source
 from msview.method_pane import MethodPane
+from msview.unidec_pane import UniDecPane
 from msview.panes import MS1_PEN, ChromatogramPane, MS2Pane, SpectrumPane
 
 MAX_AVERAGE_SCANS = 500
 AVERAGE_PPM = 5.0
+LOCK_LABEL = "Lock isolation window"
+VIEW_UNIDEC = 2  # index in the View dropdown
 MS2_SEARCH_RT_WINDOW = 1.0  # min either side, when clicking an MS1 peak
 MS2_SEARCH_PPM = 20.0
 XIC_DEFAULT_PPM = 10.0
@@ -37,6 +40,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ms2_list = np.empty(0, dtype=np.int32)
         self.ms2_pos = 0
         self._ms2_where = ""
+        # (precursor m/z, isolation window) kept on the MS1 pane while locked.
+        self._locked: tuple[float, tuple[float, float] | None] | None = None
         self._generation = 0  # invalidates stale background results
         self._xic_generation = 0
         self._method_state = "empty"  # empty / loading / loaded, for the current file
@@ -64,6 +69,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ms2.set_nav_enabled(False, False)
 
         self.method = MethodPane()
+        self.unidec = UniDecPane(runner=self._run)
 
         # Below the chromatogram: either the MS1/MS2 spectra or the Method view.
         spectra = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
@@ -74,6 +80,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lower = QtWidgets.QStackedWidget()
         self.lower.addWidget(spectra)
         self.lower.addWidget(self.method)
+        self.lower.addWidget(self.unidec)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         splitter.setChildrenCollapsible(False)
@@ -81,7 +88,8 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.addWidget(self.lower)
         splitter.setSizes([300, 700])
         self.setCentralWidget(splitter)
-        for pane in (self.chrom, self.ms1, self.ms2, self.method.gradient):
+        for pane in (self.chrom, self.ms1, self.ms2, self.method.gradient,
+                     self.unidec.spectrum, self.unidec.masses):
             pane.hover.connect(self.statusBar().showMessage)
             pane.activated.connect(lambda p=pane: self.set_active_pane(p))
         self.active_pane = self.chrom
@@ -125,9 +133,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.xic_action = toolbar.addWidget(self._build_xic_fields())
         self.xic_action.setVisible(False)
         toolbar.addSeparator()
+        self.lock_box = QtWidgets.QCheckBox(LOCK_LABEL)
+        self.lock_box.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.lock_box.setToolTip("Keep the MS1 isolation window where it is while you step through time")
+        self.lock_box.toggled.connect(self._on_lock_toggled)
+        toolbar.addWidget(self.lock_box)
+        toolbar.addSeparator()
         toolbar.addWidget(QtWidgets.QLabel(" View: "))
         self.view_box = QtWidgets.QComboBox()
-        self.view_box.addItems(["MS1 / MS2 spectra", "Method & run info"])
+        self.view_box.addItems(["MS1 / MS2 spectra", "Method & run info", "UniDec (intact mass)"])
         self.view_box.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.view_box.setToolTip("What to show below the chromatogram")
         self.view_box.currentIndexChanged.connect(self._on_view_changed)
@@ -212,8 +226,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_view_changed(self, index: int):
         self.lower.setCurrentIndex(index)
-        if not self._method_view() and self.active_pane is self.method.gradient:
-            self.set_active_pane(self.chrom)
+        if not self.lower.currentWidget().isAncestorOf(self.active_pane):
+            self.set_active_pane(self.chrom)  # the active pane just went off screen
+        self.unidec.set_shown(index == VIEW_UNIDEC)
         self._load_method_info()
 
     def _load_method_info(self):
@@ -298,6 +313,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.source.close()
         self.source, self.idx = None, None
         self._xic_cache.clear()
+        self.lock_box.setChecked(False)  # a lock belongs to one file
+        self.unidec.clear(f"Loading {path.name}…")
         self._method_state = "empty"
         self.method.set_info(None, f"Loading {path.name}…")
         self.current_ms1, self.rt_range = None, None
@@ -495,8 +512,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chrom.show_cursor(float(row["rt"]))
         self.method.gradient.show_cursor(float(row["rt"]))
         spec = self.source.spectrum(scan)
-        self.ms1.set_spectrum(spec, f"MS1   |   scan {scan}   |   RT {row['rt']:.3f} min",
-                              export_name=f"ms1_scan{scan}.csv")
+        self._show_ms1(spec, f"MS1   |   scan {scan}   |   RT {row['rt']:.3f} min", f"ms1_scan{scan}.csv")
         self._set_ms2_list(ix.ms2_for_cycle(self.idx, scan), "in this cycle")
 
     def select_range(self, rt0: float, rt1: float):
@@ -528,9 +544,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if generation != self._generation:
                 return
             title = (f"MS1   |   average of {len(used)} scans   |   RT {rt0:.3f}–{rt1:.3f} min{warning}")
-            self.ms1.set_spectrum(spec, title, export_name=f"ms1_avg_{rt0:.2f}-{rt1:.2f}min.csv")
+            self._show_ms1(spec, title, f"ms1_avg_{rt0:.2f}-{rt1:.2f}min.csv")
 
         self._run(lambda: source.average(used, ppm=AVERAGE_PPM), done)
+
+    def _show_ms1(self, spec, title: str, export_name: str):
+        """Show an MS1 (single or averaged); the UniDec view deconvolves the same spectrum."""
+        self.ms1.set_spectrum(spec, title, export_name=export_name)
+        self.unidec.set_input(spec, title.replace("MS1   |   ", "MS1 ", 1))
 
     def step_ms1(self, step: int):
         if self.idx is None:
@@ -549,9 +570,55 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_ms2_list(self, scans: np.ndarray, where: str):
         self.ms2_list = scans
-        self.ms2_pos = 0
+        self.ms2_pos = self._locked_match(scans)
         self._ms2_where = where
         self._show_ms2()
+
+    def _locked_match(self, scans: np.ndarray) -> int:
+        """While locked, open the list on the MS2 that fragmented the locked m/z."""
+        if self._locked is None or not len(scans):
+            return 0
+        rows = np.searchsorted(self.idx["scan"], scans)
+        mz = self._locked[0]
+        exact, in_window = ix.precursor_matches(self.idx, rows, mz, MS2_SEARCH_PPM)
+        hits = exact if exact.any() else in_window
+        if not hits.any():
+            return 0
+        return int(np.argmin(np.where(hits, np.abs(self.idx["precursor_mz"][rows] - mz), np.inf)))
+
+    # --- isolation-window lock ---------------------------------------------
+
+    def _on_lock_toggled(self, checked: bool):
+        if checked:
+            row = self._current_ms2_row()
+            if row is None or not np.isfinite(row["precursor_mz"]):
+                self.lock_box.blockSignals(True)
+                self.lock_box.setChecked(False)
+                self.lock_box.blockSignals(False)
+                self.flash_status("Show an MS2 first; its isolation window is what gets locked")
+                return
+            self._locked = (float(row["precursor_mz"]), ix.isolation_window(row))
+            self.lock_box.setText(f"{LOCK_LABEL} (m/z {self._locked[0]:.4f})")
+            self.statusBar().showMessage(
+                f"Isolation window locked at m/z {self._locked[0]:.4f}; it stays put as you step through time", 6000)
+        else:
+            self._locked = None
+            self.lock_box.setText(LOCK_LABEL)
+        self._show_ms1_marker(self._current_ms2_row())
+
+    def _current_ms2_row(self):
+        if self.idx is None or not len(self.ms2_list):
+            return None
+        return self.idx[ix.row_of(self.idx, int(self.ms2_list[self.ms2_pos]))]
+
+    def _show_ms1_marker(self, row):
+        """Precursor/isolation marker on the MS1: the locked window, else the current MS2's."""
+        if self._locked is not None:
+            self.ms1.set_precursor(*self._locked, locked=True)
+        elif row is None:
+            self.ms1.set_precursor(None, None)
+        else:
+            self.ms1.set_precursor(float(row["precursor_mz"]), ix.isolation_window(row))
 
     def step_ms2(self, step: int):
         if not len(self.ms2_list):
@@ -566,14 +633,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ms2.set_nav_enabled(self.ms2_pos > 0, self.ms2_pos < n - 1)
         if not n:
             self.ms2.set_spectrum(None, f"No MS2 scans {self._ms2_where}")
-            self.ms1.set_precursor(None, None)
+            self._show_ms1_marker(None)
             self.chrom.show_ms2_marker(None)
             return
         scan = int(self.ms2_list[self.ms2_pos])
         row = self.idx[ix.row_of(self.idx, scan)]
         self.ms2.set_spectrum(self.source.spectrum(scan), self._ms2_title(row, self.ms2_pos, n),
                               export_name=f"ms{row['ms_level']}_scan{scan}.csv")
-        self.ms1.set_precursor(float(row["precursor_mz"]), ix.isolation_window(row))
+        self._show_ms1_marker(row)
         self.chrom.show_ms2_marker(float(row["rt"]))
 
     @staticmethod

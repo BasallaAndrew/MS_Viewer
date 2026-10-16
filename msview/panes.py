@@ -34,6 +34,8 @@ RANGE_BRUSH = pg.mkBrush(31, 119, 180, 50)
 ACTIVE_HEADER_STYLE = "#headerBar { background: #d6e4f5; border-top: 2px solid #1f4e9c; }"
 INACTIVE_HEADER_STYLE = "#headerBar { border-top: 2px solid transparent; }"
 ISOLATION_BRUSH = pg.mkBrush(230, 126, 0, 45)
+LOCKED_PEN = pg.mkPen("#7b3fb5", width=1.5)
+LOCKED_BRUSH = pg.mkBrush(123, 63, 181, 45)
 
 
 class NavViewBox(pg.ViewBox):
@@ -309,8 +311,14 @@ class SpectrumPane(PlotPane):
 
     export_header = "mz,intensity"
 
-    def __init__(self, pen: QtGui.QPen, parent=None):
-        super().__init__("m/z", parent=parent)
+    def __init__(self, pen: QtGui.QPen, parent=None, x_unit: str = "m/z", label_decimals: int = 4):
+        """x_unit is "m/z" for spectra or "Da" for a deconvolved mass axis."""
+        super().__init__("m/z" if x_unit == "m/z" else f"Mass ({x_unit})", parent=parent)
+        self.x_unit = x_unit
+        self.label_decimals = label_decimals
+        self.label_min_fraction = 0.0  # don't label peaks below this fraction of the visible max
+        if x_unit != "m/z":
+            self.export_header = "mass,intensity"
         self.plot.getPlotItem().setLabel("left", "Intensity")
         self.sticks = pg.PlotCurveItem(pen=pen, connect="pairs")
         self.profile = pg.PlotCurveItem(pen=pen)
@@ -359,7 +367,12 @@ class SpectrumPane(PlotPane):
         else:
             self.reset_view()
 
-    def set_precursor(self, mz: float | None, window: tuple[float, float] | None) -> None:
+    def set_precursor(self, mz: float | None, window: tuple[float, float] | None,
+                      locked: bool = False) -> None:
+        """Mark a precursor m/z and isolation window; purple and solid when locked."""
+        self.precursor_line.setPen(LOCKED_PEN if locked else PRECURSOR_PEN)
+        self.isolation.setBrush(LOCKED_BRUSH if locked else ISOLATION_BRUSH)
+        self.isolation.update()
         if mz is None or not np.isfinite(mz):
             self.precursor_line.hide()
         else:
@@ -382,6 +395,8 @@ class SpectrumPane(PlotPane):
             apex = np.flatnonzero((y[1:-1] > y[:-2]) & (y[1:-1] >= y[2:])) + 1
         else:
             apex = np.flatnonzero(y > 0)
+        if self.label_min_fraction and len(y):
+            apex = apex[y[apex] >= self.label_min_fraction * y.max()]
         order = apex[np.argsort(y[apex])[::-1][: LABEL_COUNT * 8]]
 
         lo, hi = self.vb.viewRange()[0]
@@ -398,7 +413,7 @@ class SpectrumPane(PlotPane):
             px = (mz - lo) * px_per_x
             edge = LABEL_MIN_PX / 2
             label.setAnchor((0.0 if px < edge else 1.0 if px > self.vb.width() - edge else 0.5, 1.0))
-            label.setText(f"{mz:.4f}")
+            label.setText(f"{mz:.{self.label_decimals}f}")
             label.setPos(mz, y[i])
             label.show()
             placed.append(mz)
@@ -422,7 +437,7 @@ class SpectrumPane(PlotPane):
         return "spectrum"
 
     def add_menu_actions(self, menu: QtWidgets.QMenu, x: float) -> None:
-        mz = self.peak_near(x)
+        mz = self.peak_near(x) if self.x_unit == "m/z" else None
         if mz is not None:
             menu.addAction(f"XIC of m/z {mz:.4f}", lambda: self.xicRequested.emit(mz))
             menu.addSeparator()
@@ -442,7 +457,9 @@ class SpectrumPane(PlotPane):
 
     def hover_text(self, x: float) -> str:
         i = self.nearest(x)
-        return f"m/z {self._x[i]:.4f}   intensity {self._y[i]:.4g}"
+        if self.x_unit == "m/z":
+            return f"m/z {self._x[i]:.4f}   intensity {self._y[i]:.4g}"
+        return f"mass {self._x[i]:.{self.label_decimals}f} {self.x_unit}   intensity {self._y[i]:.4g}"
 
 
 class MS2Pane(SpectrumPane):
